@@ -60,6 +60,7 @@ type Messenger interface {
 	Start() error
 	Stop() error
 	UPID() *upid.UPID
+	Done() <-chan struct{}
 }
 
 // MesosMessenger is an implementation of the Messenger interface.
@@ -119,6 +120,8 @@ func (m *MesosMessenger) Send(ctx context.Context, upid *upid.UPID, msg proto.Me
 	name := getMessageName(msg)
 	log.V(2).Infof("Sending message %v to %v\n", name, upid)
 	select {
+	case <-m.stop:
+		return fmt.Errorf("cannot send because already stopped")
 	case <-ctx.Done():
 		return ctx.Err()
 	case m.encodingQueue <- &Message{upid, name, msg, nil}:
@@ -154,16 +157,17 @@ func (m *MesosMessenger) Start() error {
 
 	m.stop = make(chan struct{})
 	errChan := make(chan error)
-	go func() {
-		if err := m.tr.Start(); err != nil {
-			errChan <- err
-		}
-	}()
+	go func() { errChan <- m.tr.Start() }()
 
 	select {
 	case err := <-errChan:
-		return err
+		if err != nil {
+			return err
+		}
 	case <-time.After(preparePeriod):
+		// timeout
+		// TODO(jdef) cancel the transport Start() call somehow
+		return fmt.Errorf("timed out waiting for transport to start")
 	}
 	for i := 0; i < sendRoutines; i++ {
 		go m.sendLoop()
@@ -175,6 +179,10 @@ func (m *MesosMessenger) Start() error {
 		go m.decodeLoop()
 	}
 	return nil
+}
+
+func (m *MesosMessenger) Done() <-chan struct{} {
+	return m.stop
 }
 
 // Stop stops the messenger and clean up all the goroutines.

@@ -14,6 +14,7 @@ LIBS :=	\
 	mesosproto \
 	mesosutil \
 	messenger \
+	pkg/sched \
 	scheduler \
 	upid
 
