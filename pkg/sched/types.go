@@ -11,9 +11,10 @@ import (
 	"golang.org/x/net/context"
 )
 
+// operations generally follow a request/response protocol.
+// internal ops (and these are very limited) are exempted from this pattern (see NO_RESPONSE_REQUIRED)
 type opType int
 
-// these align with the states in mesosProto
 const (
 	startOp opType = iota
 	stopOp
@@ -28,12 +29,11 @@ const (
 	reviveOffersOp
 	frameworkMsgOp
 	reconcileTasksOp
-	__internalOps // all ops after this don't generate response, TODO(jdef) why aren't these callbacks?
+	__internalOps // all ops after this don't generate response
 	handleCallbackOp
-	masterDetectedOp
-	authCompletedOp
 )
 
+// callbacks don't have responses, they're like notifications
 type callbackType int
 
 const (
@@ -47,6 +47,9 @@ const (
 	slaveLostCb
 	executorLostCb
 	frameworkErrorCb
+	__internalCbs // calls above this come from mesos; below are for internal use
+	masterDetectedCb
+	authCompletedCb
 )
 
 type ReasonCode int

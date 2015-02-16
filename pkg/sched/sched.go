@@ -15,6 +15,7 @@ import (
 // state machine implementation of a scheduler driver
 type schedulerDriver struct {
 	ops        chan opRequest
+	callbacks  chan *callback
 	out        messenger.Messenger // send msg to mesos
 	status     statusType
 	req        opRequest // most recent
@@ -24,7 +25,7 @@ type schedulerDriver struct {
 	cache      *schedCache // concurrent cache
 	stub       SchedulerDriver
 	sched      Scheduler
-	registered bool
+	connected  bool
 	dispatch   func(ctx context.Context, cb *callback) // pluggable, dispatch an invocation against Scheduler interface
 	framework  *mesos.FrameworkInfo
 }
@@ -46,6 +47,7 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	driver := &schedulerDriver{
 		ops:       make(chan opRequest, 1024),
+		callbacks: make(chan *callback, 1024),
 		out:       out,
 		status:    NOT_STARTED,
 		cache:     newSchedCache(),
@@ -54,7 +56,7 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 	driver.dispatch = func(ctx context.Context, cb *callback) {
 		select {
 		case <-ctx.Done():
-		case driver.ops <- opRequest{opcode: handleCallbackOp, cb: cb}:
+		case driver.callbacks <- cb:
 		}
 	}
 	// forward messages from messenger to the callback dispatcher..
@@ -105,37 +107,46 @@ func (driver *schedulerDriver) opsLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+
+		case cb, ok := <-driver.callbacks:
+			if !ok {
+				panic("programming error, callbacks channel closed")
+			}
+			driver.req = opRequest{opcode: handleCallbackOp, cb: cb}
+
 		case req, ok := <-driver.ops:
 			if !ok {
 				panic("programming error, ops channel closed")
 			}
-
 			driver.req = req
+		}
 
-			//TODO(jdef) could impose a global timeout for state transitions here...
-			newstate, resp := func() (stateFn, opResponse) {
-				ctx, cancel := context.WithCancel(ctx)
-				defer cancel() // state transition is complete
-				return state(ctx, driver)
-			}()
+		//TODO(jdef) could impose a global timeout for state transitions here...
+		newstate, resp := func() (stateFn, opResponse) {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel() // state transition is complete
+			return state(ctx, driver)
+		}()
 
-			if newstate != nil {
-				state = newstate
+		if newstate == nil {
+			// no state fn change? then no status change allowed..
+			continue
+		}
+		state = newstate
+
+		switch st := resp.status; st {
+		case NO_RESPONSE_REQUIRED:
+			if driver.req.opcode < __internalOps {
+				// programming / algorithm error
+				panic(fmt.Sprintf("non-internal op generated no response: req='%+v' resp='%+v'", driver.req, resp))
 			}
-
-			switch st := resp.status; st {
-			case NO_RESPONSE_REQUIRED:
-				if req.opcode < __internalOps {
-					panic(fmt.Sprintf("non-internal op generated no response: req='%+v' resp='%+v'", req, resp))
-				}
-			default:
-				driver.status = st
-				select {
-				case <-ctx.Done():
-					return
-				case req.out <- resp:
-					// noop
-				}
+		default:
+			driver.status = st
+			select {
+			case <-ctx.Done():
+				return
+			case driver.req.out <- resp:
+				// noop
 			}
 		}
 	}
@@ -159,26 +170,21 @@ func initStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opRe
 }
 
 // driver is running and listening for a signal from the master detector.
-func detectingStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+func disconnectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
 	d.status.Check(RUNNING)
 	resp.status = d.status
 
 	switch d.req.opcode {
-	case masterDetectedOp:
-		fn, resp = d.doDetected(ctx)
 	case abortOp:
 		fn, resp = d.doAbort(ctx, nil)
 	case stopOp:
 		fn, resp = d.doStop(ctx)
-	case authCompletedOp:
-		//TODO(jdef) older authentication attempt finished, but too late...
-		fn, resp = d.doAuthCompleted(ctx)
 	case handleCallbackOp:
-		if d.req.cb.opcode == disconnectedCb {
+		resp.status = NO_RESPONSE_REQUIRED
+		if opcode := d.req.cb.opcode; opcode == disconnectedCb || opcode > __internalCbs {
 			fn = d.doCallback(ctx, d.req.cb)
 			return
 		}
-		fallthrough
 	default:
 		resp.err = d.status.Illegal(NotConnected)
 	}
@@ -193,6 +199,10 @@ func registeringStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, re
 	panic("registering state not yet implemented")
 }
 
+func connectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	panic("connected state not yet implemented")
+}
+
 func abortedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
 	panic("aborted state not yet implemented")
 }
@@ -204,13 +214,16 @@ func (s *schedulerDriver) doCallback(ctx context.Context, cb *callback) (fn stat
 	}
 	switch opcode := cb.opcode; opcode {
 	case disconnectedCb:
-		s.registered = false
-		fn = s.postDetectionStateFn()
-		s.sched.Disconnected(s.stub)
+		fn = s.handleDisconnected(ctx)
+	case masterDetectedCb:
+		fn = s.handleDetected(ctx, cb.msg)
+	case authCompletedCb:
+		fn = s.handleAuthCompleted(ctx, cb.msg)
 	case registeredCb:
-		s.handleRegistered(ctx, cb.msg)
+		fn = s.handleRegistered(ctx, cb.msg)
 	case reregisteredCb:
-		s.handleReregistered(ctx, cb.msg)
+		fn = s.handleReregistered(ctx, cb.msg)
+	//TODO(jdef) other cases here....
 	default:
 		panic(fmt.Sprintf("unrecognized callback opcode: %v", opcode))
 	}
@@ -222,22 +235,7 @@ func (s *schedulerDriver) doStop(ctx context.Context) (stateFn, opResponse) {
 }
 
 func (s *schedulerDriver) doStart(ctx context.Context) (stateFn, opResponse) {
-	return detectingStateFn, opResponse{status: RUNNING}
-}
-
-func (s *schedulerDriver) doDetected(ctx context.Context) (fn stateFn, resp opResponse) {
-	resp.status = NO_RESPONSE_REQUIRED
-	if !reflect.DeepEqual(s.master, s.req.msg) {
-		if s.req.msg != nil && !s.registered {
-			fn = s.postDetectionStateFn()
-		} else {
-			// possibilities:
-			// (a) we lost a leading master (we have or may not have been registered)
-			// (b) there is a new leading master, so signal a disconnect from the old one
-			fn = s.doCallback(ctx, &callback{opcode: disconnectedCb})
-		}
-	} // else noop, master didn't really change
-	return
+	return disconnectedStateFn, opResponse{status: RUNNING}
 }
 
 func (s *schedulerDriver) shouldAuthenticate() bool {
@@ -262,10 +260,6 @@ func (s *schedulerDriver) doAbort(ctx context.Context, err error) (fn stateFn, r
 	return
 }
 
-func (s *schedulerDriver) doAuthCompleted(ctx context.Context) (fn stateFn, resp opResponse) {
-	panic("not yet implemented")
-}
-
 func (s *schedulerDriver) doSend(ctx context.Context, msg proto.Message, nextfn stateFn, resp opResponse) (stateFn, opResponse) {
 	if err := s.out.Send(ctx, s.out.UPID(), msg); err != nil {
 		return s.doAbort(ctx, err)
@@ -278,18 +272,50 @@ func (s *schedulerDriver) doSend(ctx context.Context, msg proto.Message, nextfn 
 // they're only ever invoked if the driver is an appropriate state.
 //
 
-func (s *schedulerDriver) handleRegistered(ctx context.Context, pbmsg proto.Message) {
-	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
-	frameworkId := msg.GetFrameworkId()
-
-	s.framework.Id = frameworkId // generated by master.
-	s.sched.Registered(s.stub, frameworkId, msg.GetMasterInfo())
+func (s *schedulerDriver) handleDisconnected(ctx context.Context) (fn stateFn) {
+	s.connected = false
+	s.sched.Disconnected(s.stub)
+	fn = s.postDetectionStateFn() // enter either authenticating or registering state
+	return
 }
 
-func (s *schedulerDriver) handleReregistered(ctx context.Context, pbmsg proto.Message) {
-	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
-	frameworkId := msg.GetFrameworkId()
+func (s *schedulerDriver) handleDetected(ctx context.Context, pbmsg proto.Message) (fn stateFn) {
+	if !reflect.DeepEqual(s.master, pbmsg) {
+		if pbmsg == nil {
+			s.master = nil
+		} else {
+			// new master in town..
+			s.master = pbmsg.(*mesos.MasterInfo)
+			if !s.connected {
+				fn = s.postDetectionStateFn()
+				return
+			}
+		}
+		// possibilities:
+		// (a) we lost a leading master (we have or may not have been connected)
+		// (b) there is a new leading master, so signal a disconnect from the old one
+		fn = s.handleDisconnected(ctx)
+	}
+	// else noop, master didn't really change
+	return
+}
 
-	s.framework.Id = frameworkId // generated by master.
+func (s *schedulerDriver) handleAuthCompleted(ctx context.Context, pbmsg proto.Message) (fn stateFn) {
+	panic("not yet implemented")
+}
+
+func (s *schedulerDriver) handleRegistered(ctx context.Context, pbmsg proto.Message) stateFn {
+	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
+	s.framework.Id = msg.GetFrameworkId() // generated by master.
+	s.connected = true
+	s.sched.Registered(s.stub, s.framework.Id, msg.GetMasterInfo())
+	return connectedStateFn
+}
+
+func (s *schedulerDriver) handleReregistered(ctx context.Context, pbmsg proto.Message) stateFn {
+	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
+	//TODO(jdef) assert frameworkId from masterInfo matches what we have on record?
+	s.connected = true
 	s.sched.Reregistered(s.stub, msg.GetMasterInfo())
+	return connectedStateFn
 }
