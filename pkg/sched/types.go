@@ -37,8 +37,7 @@ const (
 type callbackType int
 
 const (
-	disconnectedCb callbackType = iota
-	registeredCb
+	registeredCb callbackType = iota
 	reregisteredCb
 	offerRescindedCb
 	resourceOffersCb
@@ -48,6 +47,7 @@ const (
 	executorLostCb
 	frameworkErrorCb
 	__internalCbs // calls above this come from mesos; below are for internal use
+	disconnectedCb
 	masterDetectedCb
 	authCompletedCb
 )
