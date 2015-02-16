@@ -124,8 +124,15 @@ type callback struct {
 type driverConfig struct {
 	framework *mesos.FrameworkInfo
 	creds     *mesos.Credentials
-	sched     Scheduler                           // receives callbacks from the driver
-	messenger func() (messenger.Messenger, error) // factory func
+	sched     Scheduler                               // receives callbacks from the driver
+	messenger func() (messenger.Messenger, error)     // factory func
+	dispatch  func(ctx context.Context, cb *callback) // if non-nil, override the default dispatch func
 }
 
+// state functions are the basis of the driver binding state machine.
+// they're responsible for deciding which, if any, ops or callbacks to process,
+// and can filter the results of the operation doXYZ or callback handleABC
+// func accordingly. they have the final say about the driver state.
+// the schedulerDriver.opsLoop is responsible for executing the transition
+// between state functions.
 type stateFn func(context.Context, *schedulerDriver) (stateFn, opResponse)

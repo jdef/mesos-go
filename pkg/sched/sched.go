@@ -20,13 +20,13 @@ type schedulerDriver struct {
 	status     statusType
 	req        opRequest // most recent
 	master     *mesos.MasterInfo
-	cancel     func() // cancels context, async loops will terminate
+	cancel     func() // cancels driver context, the driver will terminate
 	cancelOnce sync.Once
 	cache      *schedCache // concurrent cache
 	stub       SchedulerDriver
 	sched      Scheduler
 	connected  bool
-	dispatch   func(ctx context.Context, cb *callback) // pluggable, dispatch an invocation against Scheduler interface
+	dispatch   func(ctx context.Context, cb *callback) // pluggable, via config.dispatch
 	framework  *mesos.FrameworkInfo
 }
 
@@ -53,11 +53,10 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 		cache:     newSchedCache(),
 		framework: config.framework,
 	}
-	driver.dispatch = func(ctx context.Context, cb *callback) {
-		select {
-		case <-ctx.Done():
-		case driver.callbacks <- cb:
-		}
+	if config.dispatch == nil {
+		driver.dispatch = driver.defaultDispatch()
+	} else {
+		driver.dispatch = config.dispatch
 	}
 	// forward messages from messenger to the callback dispatcher..
 	for opcode, msg := range map[callbackType]proto.Message{
@@ -95,6 +94,15 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 		}
 	}()
 	return
+}
+
+func (driver *schedulerDriver) defaultDispatch() func(context.Context, *callback) {
+	return func(ctx context.Context, cb *callback) {
+		select {
+		case <-ctx.Done():
+		case driver.callbacks <- cb:
+		}
+	}
 }
 
 // serialize ops processing via state machine transitions
