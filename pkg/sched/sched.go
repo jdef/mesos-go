@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/gogo/protobuf/proto"
+	log "github.com/golang/glog"
 	mesos "github.com/mesos/mesos-go/mesosproto"
 	"github.com/mesos/mesos-go/messenger"
 	"github.com/mesos/mesos-go/upid"
@@ -18,7 +19,8 @@ type schedulerDriver struct {
 	callbacks  chan *callback
 	out        messenger.Messenger // send msg to mesos
 	status     statusType
-	req        opRequest // most recent
+	statusLock sync.RWMutex // provide the stub with a reliable view of status
+	req        opRequest    // most recent
 	master     *mesos.MasterInfo
 	cancel     func() // cancels driver context, the driver will terminate
 	cancelOnce sync.Once
@@ -82,14 +84,21 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 		ops:   driver.ops,
 		cache: driver.cache,
 		done:  ctx.Done(),
+		status: func() mesos.Status {
+			driver.statusLock.RLock()
+			defer driver.statusLock.RUnlock()
+			return mesos.Status(driver.status)
+		},
 	}
 	driver.stub, driver.sched = stub, config.sched
 	go func() {
 		go driver.opsLoop(ctx)
 		select {
 		case <-ctx.Done():
+			log.Infoln("shutdown: stopping internal messenger")
 			out.Stop()
 		case <-out.Done():
+			log.Infoln("detected stopped messenger, initiating driver shutdown")
 			driver.cancel()
 		}
 	}()
@@ -100,12 +109,14 @@ func (driver *schedulerDriver) defaultDispatch() func(context.Context, *callback
 	return func(ctx context.Context, cb *callback) {
 		select {
 		case <-ctx.Done():
+			log.Warningf("discarding callback because driver is shutting down: %+v", cb)
 		case driver.callbacks <- cb:
 		}
 	}
 }
 
-// serialize ops processing via state machine transitions
+// serialize ops processing via state machine transitions. this is the ONLY func that
+// should change driver.status.
 func (driver *schedulerDriver) opsLoop(ctx context.Context) {
 	defer func() {
 		driver.status = ABORTED
@@ -114,6 +125,7 @@ func (driver *schedulerDriver) opsLoop(ctx context.Context) {
 	for state := initStateFn; driver.status != ABORTED; {
 		select {
 		case <-ctx.Done():
+			log.V(1).Infoln("exiting ops loop, driver is shutting down")
 			return
 
 		case cb, ok := <-driver.callbacks:
@@ -149,9 +161,14 @@ func (driver *schedulerDriver) opsLoop(ctx context.Context) {
 				panic(fmt.Sprintf("non-internal op generated no response: req='%+v' resp='%+v'", driver.req, resp))
 			}
 		default:
+			// need to synchronize here so that the stub has a reliable view
+			driver.statusLock.Lock()
 			driver.status = st
+			driver.statusLock.Unlock()
+
 			select {
 			case <-ctx.Done():
+				log.Warningf("discarding op response because driver is shutting down: %+v", resp)
 				return
 			case driver.req.out <- resp:
 				// noop

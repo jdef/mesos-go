@@ -1,8 +1,6 @@
 package sched
 
 import (
-	"sync/atomic"
-
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
 	mesos "github.com/mesos/mesos-go/mesosproto"
@@ -13,7 +11,7 @@ import (
 // for a response from the driver binding.
 type schedulerDriverStub struct {
 	ops           chan<- opRequest
-	status        statusType // cached from most recent driver call
+	status        func() mesos.Status
 	frameworkInfo mesos.FrameworkInfo
 	cache         *schedCache // concurrent cache
 	done          <-chan struct{}
@@ -24,24 +22,21 @@ func (s *schedulerDriverStub) execAndWait(req opRequest) (mesos.Status, error) {
 	req.out = ch
 	select {
 	case <-s.done:
+		log.Warningf("discarding pending op request, driver is shutting down: %+v", &req)
 		return mesos.Status(ABORTED), terminatedError
 	case s.ops <- req:
 		select {
 		case <-s.done:
+			log.Warningln("aborting pending op, driver is shutting down")
 			return mesos.Status(ABORTED), terminatedError
 		case resp, ok := <-ch:
 			if !ok {
 				panic("response channel closed")
 			} else {
-				defer atomic.StoreInt32((*int32)(&s.status), int32(resp.status))
 				return mesos.Status(resp.status), resp.err
 			}
 		}
 	}
-}
-
-func (s *schedulerDriverStub) _status() mesos.Status {
-	return mesos.Status(atomic.LoadInt32((*int32)(&s.status)))
 }
 
 //
@@ -80,7 +75,7 @@ func (s *schedulerDriverStub) SendFrameworkMessage(executorID *mesos.ExecutorID,
 
 func (s *schedulerDriverStub) LaunchTasks(offers []*mesos.OfferID, tasks []*mesos.TaskInfo, filters *mesos.Filters) (mesos.Status, error) {
 	if msg, err := s.buildLaunchTasks(offers, tasks, filters); err != nil {
-		return s._status(), err
+		return s.status(), err
 	} else {
 		return s.execAndWait(opRequest{opcode: launchTasksOp, msg: msg})
 	}
