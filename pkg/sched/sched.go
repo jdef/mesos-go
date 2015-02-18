@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
@@ -18,9 +19,7 @@ type schedulerDriver struct {
 	ops        chan opRequest
 	callbacks  chan *callback
 	out        messenger.Messenger // send msg to mesos
-	status     statusType
-	statusLock sync.RWMutex // provide the stub with a reliable view of status
-	req        opRequest    // most recent
+	req        opRequest           // most recent
 	master     *mesos.MasterInfo
 	cancel     func() // cancels driver context, the driver will terminate
 	cancelOnce sync.Once
@@ -50,7 +49,6 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 		ops:       make(chan opRequest, 1024),
 		callbacks: make(chan *callback, 1024),
 		out:       out,
-		status:    NOT_STARTED,
 		cache:     newSchedCache(),
 		framework: config.framework,
 	}
@@ -79,19 +77,22 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 	driver.cancel = func() {
 		driver.cancelOnce.Do(cancel)
 	}
+	status := NOT_STARTED
+	setStatus := func(s statusType) statusType {
+		atomic.StoreInt32((*int32)(&status), int32(s))
+		return s
+	}
 	stub = &schedulerDriverStub{
 		ops:   driver.ops,
 		cache: driver.cache,
 		done:  ctx.Done(),
 		status: func() mesos.Status {
-			driver.statusLock.RLock()
-			defer driver.statusLock.RUnlock()
-			return mesos.Status(driver.status)
+			return mesos.Status(atomic.LoadInt32((*int32)(&status)))
 		},
 	}
 	driver.stub, driver.sched = stub, config.sched
 	go func() {
-		go driver.opsLoop(ctx)
+		go driver.opsLoop(ctx, status, setStatus)
 		select {
 		case <-ctx.Done():
 			log.Infoln("shutdown: stopping internal messenger")
@@ -114,28 +115,39 @@ func (driver *schedulerDriver) defaultDispatch() func(context.Context, *callback
 	}
 }
 
-// serialize ops processing via state machine transitions. this is the ONLY func that
-// should change driver.status.
-func (driver *schedulerDriver) opsLoop(ctx context.Context) {
+// Serialize ops processing via state machine transitions. The callbacks and ops channels are
+// processed with equal priority until either the ctx.Done channel closes or else the driver
+// status becomes ABORTED. The initial state is determined from the status parameter. The state
+// machine moves forward by invoking state functions (stateFn), interpreting the results by
+// applying the following (exclusive) rules, in order:
+//
+// State functions that return:
+//   - a different status will always advance to the initial stateFunc for that status
+//   - the same status and a non-nil stateFunc will advance to the new stateFunc
+//   - the same status and a nil stateFunc will not advance (and will be invoked for the next op)
+//
+func (driver *schedulerDriver) opsLoop(ctx context.Context, status statusType, setStatus func(statusType) statusType) {
 	defer func() {
-		driver.status = ABORTED
+		setStatus(ABORTED)
 		driver.cancel()
 	}()
-	for state := initStateFn; driver.status != ABORTED; {
+	for state := status.initialState(); status != ABORTED; {
 		select {
 		case <-ctx.Done():
 			log.V(1).Infoln("exiting ops loop, driver is shutting down")
 			return
-
 		case cb, ok := <-driver.callbacks:
 			if !ok {
 				panic("programming error, callbacks channel closed")
 			}
-			driver.req = opRequest{opcode: handleCallbackOp, cb: cb}
-
+			driver.req = opRequest{opcode: handleCallbackOp, cb: cb} // nil .out is purposeful
 		case req, ok := <-driver.ops:
 			if !ok {
 				panic("programming error, ops channel closed")
+			} else if req.out == nil {
+				panic("programming error, opRequest.out must not be nil")
+			} else if driver.req.opcode > __internalOps {
+				panic("programming error, internal opRequest not allowed on the ops channel")
 			}
 			driver.req = req
 		}
@@ -147,43 +159,54 @@ func (driver *schedulerDriver) opsLoop(ctx context.Context) {
 			return state(ctx, driver)
 		}()
 
-		if newstate == nil {
-			// no state fn change? then no status change allowed..
-			continue
+		if resp.status != status {
+			status = setStatus(resp.status)
+			state = status.initialState()
+		} else if newstate != nil {
+			state = newstate
 		}
-		state = newstate
 
-		switch st := resp.status; st {
-		case NO_RESPONSE_REQUIRED:
-			if driver.req.opcode < __internalOps {
-				// programming / algorithm error
-				panic(fmt.Sprintf("non-internal op generated no response: req='%+v' resp='%+v'", driver.req, resp))
-			}
-			if resp.err != nil {
-				log.Error(resp.err)
-			}
-		default:
-			// need to synchronize here so that the stub has a reliable view
-			driver.statusLock.Lock()
-			driver.status = st
-			driver.statusLock.Unlock()
-
+		if driver.req.out != nil {
 			select {
 			case <-ctx.Done():
 				log.Warningf("discarding op response because driver is shutting down: %+v", resp)
 				return
-			case driver.req.out <- resp:
-				// noop
+			case driver.req.out <- resp: // noop
 			}
+		} else if resp.err != nil {
+			log.Error(resp.err)
 		}
 	}
 }
 
+func (status statusType) initialState() (fn stateFn) {
+	switch status {
+	case NOT_STARTED:
+		return status.initStateFn
+	case RUNNING:
+		return status.disconnectedStateFn
+	case STOPPED:
+		return status.stoppedStateFn
+	case ABORTED:
+		return status.abortedStateFn
+	default:
+		panic(fmt.Sprintln("unsupported status type: %v", status))
+	}
+}
+
+// panic if the actual status doesn't match the expected status.
+// should be used to guard against programming errors.
+func (actual statusType) check(expected statusType) statusType {
+	if actual != expected {
+		panic(fmt.Sprintf("expected status %v instead of %v", expected, actual))
+	}
+	return actual
+}
+
 // driver is not running in this state.
 // allowable ops are: start, abort, run
-func initStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
-	d.status.Check(NOT_STARTED)
-	resp.status = d.status
+func (currentStatus statusType) initStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	resp.status = currentStatus.check(NOT_STARTED)
 
 	switch d.req.opcode {
 	case startOp, runOp:
@@ -191,72 +214,68 @@ func initStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opRe
 	case abortOp:
 		fn, resp = d.doAbort(ctx, nil)
 	default:
-		resp.err = d.status.Illegal(NotRunning)
+		resp.err = currentStatus.Illegal(NotRunning)
 	}
 	return
 }
 
 // driver is running and listening for a signal from the master detector.
-func disconnectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
-	d.status.Check(RUNNING)
-	resp.status = d.status
+func (currentStatus statusType) disconnectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	resp.status = currentStatus.check(RUNNING)
 
 	switch d.req.opcode {
 	case abortOp:
 		fn, resp = d.doAbort(ctx, nil)
 	case stopOp:
-		fn, resp = d.doStop(ctx)
+		fn, resp = d.doStop(ctx, false)
 	case handleCallbackOp:
-		resp.status = NO_RESPONSE_REQUIRED
 		switch cb := d.req.cb; cb.opcode {
 		case masterDetectedCb:
 			fn = d.postDetectionStateFn()
 			// ..and ignore every other callback while we're disconnected
 		}
 	default:
-		resp.err = d.status.Illegal(NotConnected)
+		resp.err = currentStatus.Illegal(NotConnected)
 	}
 	return
 }
 
-func authenticatingStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+func (currentStatus statusType) authenticatingStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
 	panic("authenticating state not yet implemented")
 }
 
-func registeringStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
-	d.status.Check(RUNNING)
-	resp.status = d.status
+func (currentStatus statusType) registeringStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	resp.status = currentStatus.check(RUNNING)
 
 	switch d.req.opcode {
 	case abortOp:
 		fn, resp = d.doAbort(ctx, nil)
 	case stopOp:
-		fn, resp = d.doStop(ctx)
+		fn, resp = d.doStop(ctx, false)
 	case handleCallbackOp:
-		resp.status = NO_RESPONSE_REQUIRED
 		switch cb := d.req.cb; cb.opcode {
 		case masterDetectedCb:
 			fn, _ = d.handleMasterChanged(ctx, cb.msg)
+		case registeredCb:
 			//TODO(jdef) handle registeredCb
+		case reregisteredCb:
 			//TODO(jdef) handle reregisteredCb
 		}
 	default:
-		resp.err = d.status.Illegal(NotConnected)
+		resp.err = currentStatus.Illegal(NotConnected)
 	}
 	return
 }
 
-func connectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
-	d.status.Check(RUNNING)
-	resp.status = d.status
+func (currentStatus statusType) connectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	resp.status = currentStatus.check(RUNNING)
 
 	switch d.req.opcode {
 	case abortOp:
 		fn, resp = d.doAbort(ctx, nil)
 	case stopOp:
-		fn, resp = d.doStop(ctx)
+		fn, resp = d.doStop(ctx, true)
 	case handleCallbackOp:
-		resp.status = NO_RESPONSE_REQUIRED
 		switch cb := d.req.cb; cb.opcode {
 		case disconnectedCb:
 			d.sched.Disconnected(d.stub)
@@ -271,13 +290,17 @@ func connectedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp
 			fn = d.doCallback(ctx, cb)
 		}
 	default:
-		resp.err = d.status.Illegal(NotConnected)
+		resp.err = currentStatus.Illegal(NotConnected)
 	}
 	return
 }
 
-func abortedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+func (currentStatus statusType) abortedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
 	panic("aborted state not yet implemented")
+}
+
+func (currentStatus statusType) stoppedStateFn(ctx context.Context, d *schedulerDriver) (fn stateFn, resp opResponse) {
+	panic("stopped state not yet implemented")
 }
 
 func (s *schedulerDriver) doCallback(ctx context.Context, cb *callback) (fn stateFn) {
@@ -303,12 +326,13 @@ func (s *schedulerDriver) doCallback(ctx context.Context, cb *callback) (fn stat
 	return
 }
 
-func (s *schedulerDriver) doStop(ctx context.Context) (stateFn, opResponse) {
+func (s *schedulerDriver) doStop(ctx context.Context, connected bool) (stateFn, opResponse) {
 	panic("stop not yet implemented")
 }
 
-func (s *schedulerDriver) doStart(ctx context.Context) (stateFn, opResponse) {
-	return disconnectedStateFn, opResponse{status: RUNNING}
+func (s *schedulerDriver) doStart(ctx context.Context) (fn stateFn, resp opResponse) {
+	resp.status = RUNNING
+	return
 }
 
 func (s *schedulerDriver) shouldAuthenticate() bool {
@@ -317,17 +341,13 @@ func (s *schedulerDriver) shouldAuthenticate() bool {
 
 func (s *schedulerDriver) postDetectionStateFn() stateFn {
 	if s.shouldAuthenticate() {
-		return authenticatingStateFn
+		return RUNNING.authenticatingStateFn
 	} else {
-		return registeringStateFn
+		return RUNNING.registeringStateFn
 	}
 }
 
 func (s *schedulerDriver) doAbort(ctx context.Context, err error) (fn stateFn, resp opResponse) {
-	switch s.status {
-	// probably need to do different things here depending if we're running already
-	}
-	fn = abortedStateFn
 	resp.status = ABORTED
 	resp.err = err
 	return
@@ -352,7 +372,7 @@ func (d *schedulerDriver) handleMasterChanged(ctx context.Context, pbmsg proto.M
 			fn = d.postDetectionStateFn()
 		} else {
 			masterLost = true
-			fn = disconnectedStateFn
+			fn = RUNNING.initialState()
 		}
 	}
 	return
@@ -383,12 +403,12 @@ func (s *schedulerDriver) handleRegistered(ctx context.Context, pbmsg proto.Mess
 	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
 	s.framework.Id = msg.GetFrameworkId() // generated by master.
 	s.sched.Registered(s.stub, s.framework.Id, msg.GetMasterInfo())
-	return connectedStateFn
+	return RUNNING.connectedStateFn
 }
 
 func (s *schedulerDriver) handleReregistered(ctx context.Context, pbmsg proto.Message) stateFn {
 	msg := pbmsg.(*mesos.FrameworkRegisteredMessage)
 	//TODO(jdef) assert frameworkId from masterInfo matches what we have on record?
 	s.sched.Reregistered(s.stub, msg.GetMasterInfo())
-	return connectedStateFn
+	return RUNNING.connectedStateFn
 }

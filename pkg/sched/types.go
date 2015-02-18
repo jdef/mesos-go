@@ -2,7 +2,6 @@ package sched
 
 import (
 	"errors"
-	"fmt"
 
 	"github.com/gogo/protobuf/proto"
 	mesos "github.com/mesos/mesos-go/mesosproto"
@@ -12,7 +11,7 @@ import (
 )
 
 // operations generally follow a request/response protocol.
-// internal ops (and these are very limited) are exempted from this pattern (see NO_RESPONSE_REQUIRED)
+// internal ops (and these are very limited) are exempted from this pattern.
 type opType int
 
 const (
@@ -78,17 +77,7 @@ const (
 	RUNNING     = statusType(mesos.Status_DRIVER_RUNNING)
 	ABORTED     = statusType(mesos.Status_DRIVER_ABORTED)
 	STOPPED     = statusType(mesos.Status_DRIVER_STOPPED)
-
-	NO_RESPONSE_REQUIRED = statusType(999)
 )
-
-// panic if the actual status doesn't match the expected status.
-// should be used to guard against programming errors.
-func (actual statusType) Check(expected statusType) {
-	if actual != expected {
-		panic(fmt.Sprintf("expected status %v instead of %v", expected, actual))
-	}
-}
 
 // the driver cannot proceed with the operation given its current status
 func (actual statusType) Illegal(r ReasonCode) error {
@@ -135,4 +124,7 @@ type driverConfig struct {
 // func accordingly. they have the final say about the driver state.
 // the schedulerDriver.opsLoop is responsible for executing the transition
 // between state functions.
+//
+// see schedulerDriver.opsLoop for details of how the returned args of this
+// func are processed.
 type stateFn func(context.Context, *schedulerDriver) (stateFn, opResponse)
