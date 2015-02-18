@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"sync/atomic"
 
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
@@ -77,22 +76,16 @@ func New(config driverConfig) (stub SchedulerDriver, err error) {
 	driver.cancel = func() {
 		driver.cancelOnce.Do(cancel)
 	}
-	status := NOT_STARTED
-	setStatus := func(s statusType) statusType {
-		atomic.StoreInt32((*int32)(&status), int32(s))
-		return s
-	}
-	stub = &schedulerDriverStub{
-		ops:   driver.ops,
-		cache: driver.cache,
-		done:  ctx.Done(),
-		status: func() mesos.Status {
-			return mesos.Status(atomic.LoadInt32((*int32)(&status)))
-		},
-	}
+	status := make(chan mesos.Status)
+	stub = newStub(schedulerDriverStub{
+		ops:           driver.ops,
+		cache:         driver.cache,
+		frameworkInfo: *config.framework,
+	}, status)
+
 	driver.stub, driver.sched = stub, config.sched
 	go func() {
-		go driver.opsLoop(ctx, status, setStatus)
+		go driver.opsLoop(ctx, NOT_STARTED, status)
 		select {
 		case <-ctx.Done():
 			log.Infoln("shutdown: stopping internal messenger")
@@ -126,9 +119,9 @@ func (driver *schedulerDriver) defaultDispatch() func(context.Context, *callback
 //   - the same status and a non-nil stateFunc will advance to the new stateFunc
 //   - the same status and a nil stateFunc will not advance (and will be invoked for the next op)
 //
-func (driver *schedulerDriver) opsLoop(ctx context.Context, status statusType, setStatus func(statusType) statusType) {
+func (driver *schedulerDriver) opsLoop(ctx context.Context, status statusType, statusCh chan<- mesos.Status) {
 	defer func() {
-		setStatus(ABORTED)
+		close(statusCh)
 		driver.cancel()
 	}()
 	for state := status.initialState(); status != ABORTED; {
@@ -160,8 +153,14 @@ func (driver *schedulerDriver) opsLoop(ctx context.Context, status statusType, s
 		}()
 
 		if resp.status != status {
-			status = setStatus(resp.status)
+			status = resp.status
 			state = status.initialState()
+			select {
+			case statusCh <- mesos.Status(status): // noop
+			case <-ctx.Done():
+				log.Warningf("discarding status update because driver is shutting down")
+				return
+			}
 		} else if newstate != nil {
 			state = newstate
 		}

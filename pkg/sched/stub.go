@@ -1,6 +1,8 @@
 package sched
 
 import (
+	"sync/atomic"
+
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
 	mesos "github.com/mesos/mesos-go/mesosproto"
@@ -11,10 +13,19 @@ import (
 // for a response from the driver binding.
 type schedulerDriverStub struct {
 	ops           chan<- opRequest
-	status        func() mesos.Status
 	frameworkInfo mesos.FrameworkInfo
-	cache         *schedCache // concurrent cache
-	done          <-chan struct{}
+	cache         *schedCache   // concurrent cache
+	done          chan struct{} // closed when we stop receiving status updates (driver shutdown)
+	status        mesos.Status
+}
+
+// create a new driver stub that consumes status updates from the driver
+// until the status channel closes, via go schedulerDriverStub.run.
+func newStub(prototype schedulerDriverStub, status <-chan mesos.Status) *schedulerDriverStub {
+	stub := prototype
+	stub.done = make(chan struct{})
+	go stub.run(status)
+	return &stub
 }
 
 func (s *schedulerDriverStub) execAndWait(req opRequest) (mesos.Status, error) {
@@ -33,9 +44,20 @@ func (s *schedulerDriverStub) execAndWait(req opRequest) (mesos.Status, error) {
 			if !ok {
 				panic("response channel closed")
 			} else {
-				return mesos.Status(resp.status), resp.err
+				return s.getStatus(), resp.err
 			}
 		}
+	}
+}
+
+func (s *schedulerDriverStub) getStatus() mesos.Status {
+	return mesos.Status(atomic.LoadInt32((*int32)(&s.status)))
+}
+
+func (s *schedulerDriverStub) run(status <-chan mesos.Status) {
+	defer close(s.done)
+	for st := range status {
+		atomic.StoreInt32((*int32)(&s.status), int32(st))
 	}
 }
 
@@ -75,7 +97,7 @@ func (s *schedulerDriverStub) SendFrameworkMessage(executorID *mesos.ExecutorID,
 
 func (s *schedulerDriverStub) LaunchTasks(offers []*mesos.OfferID, tasks []*mesos.TaskInfo, filters *mesos.Filters) (mesos.Status, error) {
 	if msg, err := s.buildLaunchTasks(offers, tasks, filters); err != nil {
-		return s.status(), err
+		return s.getStatus(), err
 	} else {
 		return s.execAndWait(opRequest{opcode: launchTasksOp, msg: msg})
 	}
