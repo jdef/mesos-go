@@ -35240,6 +35240,36 @@ func (mj *OperationStatus) MarshalJSONBuf(buf fflib.EncodingBuffer) error {
 			buf.WriteByte(',')
 		}
 	}
+	if mj.AgentID != nil {
+		if true {
+			buf.WriteString(`"agent_id":`)
+
+			{
+
+				err = mj.AgentID.MarshalJSONBuf(buf)
+				if err != nil {
+					return err
+				}
+
+			}
+			buf.WriteByte(',')
+		}
+	}
+	if mj.ResourceProviderID != nil {
+		if true {
+			buf.WriteString(`"resource_provider_id":`)
+
+			{
+
+				err = mj.ResourceProviderID.MarshalJSONBuf(buf)
+				if err != nil {
+					return err
+				}
+
+			}
+			buf.WriteByte(',')
+		}
+	}
 	buf.Rewind(1)
 	buf.WriteByte('}')
 	return nil
@@ -35258,6 +35288,10 @@ const (
 	ffj_t_OperationStatus_ConvertedResources
 
 	ffj_t_OperationStatus_UUID
+
+	ffj_t_OperationStatus_AgentID
+
+	ffj_t_OperationStatus_ResourceProviderID
 )
 
 var ffj_key_OperationStatus_OperationID = []byte("operation_id")
@@ -35269,6 +35303,10 @@ var ffj_key_OperationStatus_Message = []byte("message")
 var ffj_key_OperationStatus_ConvertedResources = []byte("converted_resources")
 
 var ffj_key_OperationStatus_UUID = []byte("uuid")
+
+var ffj_key_OperationStatus_AgentID = []byte("agent_id")
+
+var ffj_key_OperationStatus_ResourceProviderID = []byte("resource_provider_id")
 
 func (uj *OperationStatus) UnmarshalJSON(input []byte) error {
 	fs := fflib.NewFFLexer(input)
@@ -35329,6 +35367,14 @@ mainparse:
 			} else {
 				switch kn[0] {
 
+				case 'a':
+
+					if bytes.Equal(ffj_key_OperationStatus_AgentID, kn) {
+						currentKey = ffj_t_OperationStatus_AgentID
+						state = fflib.FFParse_want_colon
+						goto mainparse
+					}
+
 				case 'c':
 
 					if bytes.Equal(ffj_key_OperationStatus_ConvertedResources, kn) {
@@ -35353,6 +35399,14 @@ mainparse:
 						goto mainparse
 					}
 
+				case 'r':
+
+					if bytes.Equal(ffj_key_OperationStatus_ResourceProviderID, kn) {
+						currentKey = ffj_t_OperationStatus_ResourceProviderID
+						state = fflib.FFParse_want_colon
+						goto mainparse
+					}
+
 				case 's':
 
 					if bytes.Equal(ffj_key_OperationStatus_State, kn) {
@@ -35369,6 +35423,18 @@ mainparse:
 						goto mainparse
 					}
 
+				}
+
+				if fflib.EqualFoldRight(ffj_key_OperationStatus_ResourceProviderID, kn) {
+					currentKey = ffj_t_OperationStatus_ResourceProviderID
+					state = fflib.FFParse_want_colon
+					goto mainparse
+				}
+
+				if fflib.AsciiEqualFold(ffj_key_OperationStatus_AgentID, kn) {
+					currentKey = ffj_t_OperationStatus_AgentID
+					state = fflib.FFParse_want_colon
+					goto mainparse
 				}
 
 				if fflib.SimpleLetterEqualFold(ffj_key_OperationStatus_UUID, kn) {
@@ -35432,6 +35498,12 @@ mainparse:
 
 				case ffj_t_OperationStatus_UUID:
 					goto handle_UUID
+
+				case ffj_t_OperationStatus_AgentID:
+					goto handle_AgentID
+
+				case ffj_t_OperationStatus_ResourceProviderID:
+					goto handle_ResourceProviderID
 
 				case ffj_t_OperationStatusno_such_key:
 					err = fs.SkipField(tok)
@@ -35617,6 +35689,60 @@ handle_UUID:
 		}
 
 		err = uj.UUID.UnmarshalJSONFFLexer(fs, fflib.FFParse_want_key)
+		if err != nil {
+			return err
+		}
+		state = fflib.FFParse_after_value
+	}
+
+	state = fflib.FFParse_after_value
+	goto mainparse
+
+handle_AgentID:
+
+	/* handler: uj.AgentID type=mesos.AgentID kind=struct quoted=false*/
+
+	{
+		if tok == fflib.FFTok_null {
+
+			uj.AgentID = nil
+
+			state = fflib.FFParse_after_value
+			goto mainparse
+		}
+
+		if uj.AgentID == nil {
+			uj.AgentID = new(AgentID)
+		}
+
+		err = uj.AgentID.UnmarshalJSONFFLexer(fs, fflib.FFParse_want_key)
+		if err != nil {
+			return err
+		}
+		state = fflib.FFParse_after_value
+	}
+
+	state = fflib.FFParse_after_value
+	goto mainparse
+
+handle_ResourceProviderID:
+
+	/* handler: uj.ResourceProviderID type=mesos.ResourceProviderID kind=struct quoted=false*/
+
+	{
+		if tok == fflib.FFTok_null {
+
+			uj.ResourceProviderID = nil
+
+			state = fflib.FFParse_after_value
+			goto mainparse
+		}
+
+		if uj.ResourceProviderID == nil {
+			uj.ResourceProviderID = new(ResourceProviderID)
+		}
+
+		err = uj.ResourceProviderID.UnmarshalJSONFFLexer(fs, fflib.FFParse_want_key)
 		if err != nil {
 			return err
 		}
